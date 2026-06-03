@@ -20,69 +20,135 @@ import (
 	"syscall"
 
 	"github.com/jzelinskie/whirlpool"
+	"github.com/zeebo/blake3"
+	"github.com/zeebo/xxh3"
 	"golang.org/x/crypto/blake2b"
 	"golang.org/x/crypto/sha3"
 	"golang.org/x/sync/errgroup"
 )
 
-func worker(path string, hardLinks *sync.Map, info fs.FileInfo, hashalgo string) error {
-	var inode uint64
+type hardLinkKey struct {
+	dev uint64
+	ino uint64
+}
+
+type hardLinkResult struct {
+	hash  string
+	err   error
+	ready chan struct{}
+}
+
+type hardLinkTracker struct {
+	links sync.Map
+}
+
+func newHardLinkKey(info fs.FileInfo) (hardLinkKey, bool) {
 	stat, inodeOk := info.Sys().(*syscall.Stat_t)
-	if inodeOk {
-		inode = stat.Ino
-		h, ok := hardLinks.Load(inode)
-		if ok {
-			fmt.Printf("%s  %s  *\n", h, path)
-			return nil
-		}
+	if !inodeOk || stat.Nlink <= 1 {
+		return hardLinkKey{}, false
+	}
+	return hardLinkKey{dev: uint64(stat.Dev), ino: stat.Ino}, true
+}
+
+func (h *hardLinkTracker) claim(info fs.FileInfo) (*hardLinkResult, bool) {
+	key, ok := newHardLinkKey(info)
+	if !ok {
+		return nil, true
 	}
 
-	var hasher hash.Hash
+	result := &hardLinkResult{ready: make(chan struct{})}
+	actual, loaded := h.links.LoadOrStore(key, result)
+	if loaded {
+		return actual.(*hardLinkResult), false
+	}
+	return result, true
+}
 
+func (r *hardLinkResult) finish(hash string, err error) {
+	r.hash = hash
+	r.err = err
+	close(r.ready)
+}
+
+func (r *hardLinkResult) print(path string) error {
+	<-r.ready
+	if r.err != nil {
+		return r.err
+	}
+	fmt.Printf("%s  %s  *\n", r.hash, path)
+	return nil
+}
+
+func newHasher(hashalgo string) hash.Hash {
 	switch hashalgo {
 	case "crc32":
-		hasher = crc32.NewIEEE()
+		return crc32.NewIEEE()
 	case "crc64":
-		hasher = crc64.New(crc64.MakeTable(crc64.ISO))
+		return crc64.New(crc64.MakeTable(crc64.ISO))
 	case "md5":
-		hasher = md5.New()
+		return md5.New()
 	case "sha1":
-		hasher = sha1.New()
+		return sha1.New()
 	case "sha256":
-		hasher = sha256.New()
+		return sha256.New()
 	case "sha512":
-		hasher = sha512.New()
+		return sha512.New()
 	case "sha3-512":
-		hasher = sha3.New512()
+		return sha3.New512()
 	case "sha3-256":
-		hasher = sha3.New256()
+		return sha3.New256()
+	case "shake128-256":
+		return sha3.NewShake128()
+	case "shake256-512":
+		return sha3.NewShake256()
 	case "blake2b-512":
-		hasher, _ = blake2b.New512(nil)
+		hasher, _ := blake2b.New512(nil)
+		return hasher
 	case "blake2b-256":
-		hasher, _ = blake2b.New256(nil)
+		hasher, _ := blake2b.New256(nil)
+		return hasher
 	case "whirlpool":
-		hasher = whirlpool.New()
+		return whirlpool.New()
+	case "blake3":
+		return blake3.New()
+	case "xxh3-64":
+		return xxh3.New()
+	case "xxh3-128":
+		return xxh3.New128()
 	default:
 		fmt.Fprintf(os.Stderr, "unsupported hash algorithm %s falling back to sha256", hashalgo)
-		hasher = sha256.New()
+		return sha256.New()
 	}
+}
 
+func hashFile(path, hashalgo string) (string, error) {
+	hasher := newHasher(hashalgo)
 	file, err := os.Open(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer file.Close()
 	if _, err := io.Copy(hasher, file); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", hasher.Sum(nil)), nil
+}
+
+func worker(path string, hardLinks *hardLinkTracker, info fs.FileInfo, hashalgo string) error {
+	result, owner := hardLinks.claim(info)
+	if !owner {
+		return result.print(path)
+	}
+
+	hash, err := hashFile(path, hashalgo)
+	if result != nil {
+		result.finish(hash, err)
+	}
+	if err != nil {
 		return err
 	}
-	_ = hasher.Sum(nil)
-	hash := hasher.Sum(nil)
-	if inodeOk {
-		if stat.Nlink > 1 {
-			hardLinks.Store(inode, fmt.Sprintf("%x", hash))
-		}
-	}
-	fmt.Printf("%x  %s  -\n", hash, path)
+
+	fmt.Printf("%s  %s  -\n", hash, path)
 	return nil
 }
 
@@ -102,7 +168,7 @@ func checkSymlink(path string) (bool, string, error) {
 }
 
 func walkDirectory(dir string, eg *errgroup.Group, followSymlinks bool, hashalgo string, excludePattern *regexp.Regexp) uint64 {
-	hardLinks := new(sync.Map)
+	hardLinks := new(hardLinkTracker)
 	filecount := uint64(0)
 
 	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
@@ -154,7 +220,7 @@ func main() {
 	dir := flag.String("dir", ".", "directory to process")
 	poolSize := flag.Int("poolsize", 8, "number of workers")
 	followSymlinks := flag.Bool("follow-symlinks", false, "follow symlinks")
-	hashalgo := flag.String("hash", "sha256", "hash algorithm.  Choices are crc32, crc64, md5, sha1, sha256, sha512, sha3-512, sha3-256, blake2b-512, blake2b-256, whirlpool")
+	hashalgo := flag.String("hash", "sha256", "hash algorithm.  Choices are crc32, crc64, md5, sha1, sha256, sha512, sha3-512, sha3-256, shake128-256, shake256-512, blake2b-512, blake2b-256, whirlpool, blake3, xxh3-64, xxh3-128")
 	exclude := flag.String("exclude", "", "exclude files matching this regex pattern")
 	flag.Parse()
 
